@@ -78,8 +78,8 @@ use smithay::{
         seat::WaylandFocus,
     },
 };
-use tracing::{error, trace};
-use xkbcommon::xkb::{Keycode, Keysym};
+use tracing::{error, trace, warn};
+use xkbcommon::xkb::{self, Keycode, Keysym, compose};
 
 use std::{
     any::Any,
@@ -126,6 +126,135 @@ pub struct SupressedKeys(
 pub struct SupressedButtons(RefCell<HashMap<InputBackendId, HashSet<u32>>>);
 #[derive(Default, Debug)]
 pub struct ModifiersShortcutQueue(RefCell<HashMap<InputBackendId, shortcuts::Binding>>);
+
+/// What to do with a key after feeding it to the seat's Compose state.
+#[derive(Debug)]
+pub enum ComposeAction {
+    /// Mid-sequence: swallow the key (silently, no preedit), the sequence may still
+    /// complete.
+    Composing,
+    /// Sequence resolved: swallow the key and commit this text instead.
+    Commit(String),
+    /// Sequence consumed the key but produced nothing to commit; swallow it.
+    Discard,
+    /// Compose has no interest in this key; forward it to the client untouched.
+    Forward,
+}
+
+/// Compositor-side Compose (dead-key) sequences for a seat.
+///
+/// Toolkits that hand text entry to `zwp_text_input_v3` do no compose processing of their
+/// own: `GtkIMContextWayland` has no compose table at all and Chromium only consults one
+/// when an input method is attached. Without an IME running their dead keys are simply
+/// dropped, so `'`+`c` produces nothing in a GTK4 app and the wrong character in Chromium.
+///
+/// Running the sequences here fixes every such client at once, without requiring an
+/// external input method just to type accented characters. The table comes from
+/// [`compose::Table::new_from_locale`], which honours `$XCOMPOSEFILE`,
+/// `$XDG_CONFIG_HOME/XCompose` and `~/.XCompose` before falling back to the locale's
+/// system table, so user overrides keep working — including for clients that have never
+/// read a Compose file in their lives.
+pub struct ComposeState(RefCell<Option<compose::State>>);
+
+impl ComposeState {
+    /// Build the Compose state for a seat from the session locale.
+    ///
+    /// A missing or unparsable table is not fatal: compose is simply inert and every key is
+    /// forwarded, which is exactly the behaviour before this existed.
+    pub fn new() -> Self {
+        Self(RefCell::new(Self::load()))
+    }
+
+    fn load() -> Option<compose::State> {
+        // Same precedence libxkbcommon itself uses to pick a locale.
+        let locale = std::env::var_os("LC_ALL")
+            .or_else(|| std::env::var_os("LC_CTYPE"))
+            .or_else(|| std::env::var_os("LANG"))
+            .unwrap_or_else(|| "C".into());
+
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        match compose::Table::new_from_locale(&context, &locale, compose::COMPILE_NO_FLAGS) {
+            Ok(table) => Some(compose::State::new(&table, compose::STATE_NO_FLAGS)),
+            Err(_) => {
+                warn!(
+                    ?locale,
+                    "No Compose table for locale, compositor-side compose disabled"
+                );
+                None
+            }
+        }
+    }
+
+    /// Build from an inline table, so tests do not depend on the machine's locale or on the
+    /// developer's `~/.XCompose`.
+    #[cfg(test)]
+    fn from_buffer(table: &str) -> Self {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let table = compose::Table::new_from_buffer(
+            &context,
+            table,
+            "C",
+            compose::FORMAT_TEXT_V1,
+            compose::COMPILE_NO_FLAGS,
+        )
+        .expect("inline compose table should compile");
+        Self(RefCell::new(Some(compose::State::new(
+            &table,
+            compose::STATE_NO_FLAGS,
+        ))))
+    }
+
+    /// Whether a table was loaded and compose can do anything at all.
+    pub fn is_available(&self) -> bool {
+        self.0.borrow().is_some()
+    }
+
+    /// Feed a keysym and decide what should happen to the key event.
+    pub fn feed(&self, keysym: Keysym) -> ComposeAction {
+        let mut guard = self.0.borrow_mut();
+        let Some(state) = guard.as_mut() else {
+            return ComposeAction::Forward;
+        };
+
+        if state.feed(keysym) == compose::FeedResult::Ignored {
+            return ComposeAction::Forward;
+        }
+
+        match state.status() {
+            compose::Status::Composing => ComposeAction::Composing,
+            compose::Status::Composed => {
+                let text = state.utf8();
+                state.reset();
+                match text {
+                    Some(text) if !text.is_empty() => ComposeAction::Commit(text),
+                    // Resolved to nothing to insert. The keys are already consumed, so
+                    // swallow rather than emit a stray character.
+                    _ => ComposeAction::Discard,
+                }
+            }
+            compose::Status::Cancelled => {
+                // Invalid sequence (e.g. dead_acute then z). Drop the partial sequence and
+                // let the key through, so the client still sees what was typed.
+                state.reset();
+                ComposeAction::Forward
+            }
+            compose::Status::Nothing => ComposeAction::Forward,
+        }
+    }
+
+    /// Drop any half-finished sequence, e.g. when focus moves away.
+    pub fn reset(&self) {
+        if let Some(state) = self.0.borrow_mut().as_mut() {
+            state.reset();
+        }
+    }
+}
+
+impl Default for ComposeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl SupressedKeys {
     fn add(
@@ -2079,6 +2208,9 @@ impl State {
             self.broadcast_ei_keyboard_modifiers(&seat.get_keyboard().unwrap());
         }
 
+        // `zwp_input_method_v2` has no bind/unbind callback, so re-evaluate here. Idempotent.
+        self.update_compose_input_method(seat);
+
         let current_focus = seat.get_keyboard().unwrap().current_focus();
         let shortcuts_inhibited = current_focus.as_ref().is_some_and(|f| {
             f.wl_surface()
@@ -2633,8 +2765,115 @@ impl State {
         if clear_queue {
             seat.modifiers_shortcut_queue().clear(backend_id);
         }
+
+        // Run Compose sequences on behalf of clients that delegate text entry to
+        // `zwp_text_input_v3` but do no compose processing themselves (see `ComposeState`).
+        if let Some(result) = self.compose_filter(backend_id, seat, modifiers, &handle, key_state) {
+            return result;
+        }
+
         // keys are passed through to apps
         FilterResult::Forward
+    }
+
+    /// Feed a key press to the seat's Compose state and, when it is part of a sequence,
+    /// swallow it and drive the focused `zwp_text_input_v3` instead.
+    ///
+    /// Returns `None` when the key has nothing to do with compose and should be forwarded.
+    fn compose_filter(
+        &self,
+        backend_id: &InputBackendId,
+        seat: &Seat<Self>,
+        modifiers: &ModifiersState,
+        handle: &KeysymHandle<'_>,
+        key_state: KeyState,
+    ) -> Option<FilterResult<Option<(Action, shortcuts::Binding)>>> {
+        use smithay::wayland::input_method::InputMethodSeat;
+        use smithay::wayland::text_input::TextInputSeat;
+
+        if key_state != KeyState::Pressed {
+            return None;
+        }
+
+        // Stand down for a real input method, but detect it by its keyboard grab rather than
+        // by a bound `zwp_input_method_v2`. fcitx5 and ibus grab the keyboard because they
+        // need the keys; an on-screen keyboard binds the same protocol only to learn when a
+        // text field is focused (cosmic-osk does exactly this, injecting via libei) and must
+        // not switch compose off for the physical keyboard.
+        if seat.input_method().keyboard_grabbed() {
+            return None;
+        }
+
+        // Only Ctrl/Alt/Super take the key out of text entry. Shift and AltGr are part of
+        // the symbol itself (`dead_acute` sits on a shifted or third level in several
+        // layouts) and are already resolved into `modified_sym`.
+        if modifiers.ctrl || modifiers.alt || modifiers.logo {
+            return None;
+        }
+
+        let compose = seat.compose_state();
+        if !compose.is_available() {
+            return None;
+        }
+
+        // Nothing to drive means nothing to compose into, and swallowing the key would
+        // break clients that compose for themselves (terminals, iced/winit apps). Check
+        // before feeding so a half-finished sequence is never left behind.
+        let text_input = seat.text_input();
+        let mut has_target = false;
+        text_input.with_active_text_input(|_, _| has_target = true);
+        if !has_target {
+            compose.reset();
+            return None;
+        }
+
+        let action = compose.feed(handle.modified_sym());
+        if matches!(action, ComposeAction::Forward) {
+            return None;
+        }
+
+        // No preedit is sent while a sequence is pending. A dead key shows nothing until it
+        // resolves, which is how X11 and GTK's own `GtkIMContextSimple` behave, and it keeps
+        // us from having to track preedit state across cancellations: `zwp_text_input_v3`
+        // treats an empty-but-non-null preedit as an active one, so a sequence aborted by a
+        // navigation key would otherwise strand the client in preedit mode, where it swallows
+        // editing keys.
+        if let ComposeAction::Commit(text) = &action {
+            text_input.with_active_text_input(|ti, _| {
+                ti.commit_string(Some(text.clone()));
+            });
+            text_input.done(false);
+        }
+
+        // The press is swallowed, so swallow the matching release too instead of leaving the
+        // client with a release it never saw a press for.
+        seat.supressed_keys().add(backend_id, handle, None);
+        Some(FilterResult::Intercept(None))
+    }
+
+    /// Claim the input-method role for this seat whenever compose can do something, so the
+    /// focused client's `zwp_text_input_v3` becomes active and we have somewhere to commit.
+    ///
+    /// The role is never given back. `set_compositor_input_method(false)` sends `leave`, which
+    /// clears the active text-input and tells the client to disable, and nothing sends `enter`
+    /// again until focus moves -- so releasing it broke a real IME: fcitx5 kept its keyboard
+    /// grab but lost the text-input it was committing into, and `'`+`c` degraded to a bare `c`.
+    /// Holding the role costs nothing while an IME is bound, because smithay only consults the
+    /// flag when deciding whether to discard text-input requests with no
+    /// `zwp_input_method_v2` present, and `has_instance` already covers that case.
+    ///
+    /// Compose itself stands down in `compose_filter` on the IME's keyboard grab; that is the
+    /// only place the decision belongs.
+    ///
+    /// Called per key event because `zwp_input_method_v2` has no bind/unbind callback, and
+    /// because libei text injection toggles the same flag for its own reasons; the setter is a
+    /// no-op when the value is unchanged, so re-asserting it is cheap and self-healing.
+    pub(crate) fn update_compose_input_method(&mut self, seat: &Seat<State>) {
+        use smithay::wayland::text_input::TextInputSeat;
+
+        if seat.compose_state().is_available() {
+            seat.text_input().set_compositor_input_method(true);
+        }
     }
 
     fn keyboard_swap(
@@ -3226,5 +3465,91 @@ pub fn update_output_image_copy_cursor_position(
             session.set_cursor_hotspot(cursor_geometry.hotspot);
             session.set_cursor_pos(Some(cursor_geometry.geometry.loc));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ComposeAction, ComposeState};
+    use xkbcommon::xkb::Keysym;
+
+    // Mirrors the shape of a real Compose file: the cedilla override a Brazilian user on
+    // `us(intl)` needs, plus one ordinary acute sequence.
+    const TABLE: &str = r#"
+<dead_acute> <c> : "ç" ccedilla
+<dead_acute> <a> : "á" aacute
+"#;
+
+    fn commit(action: ComposeAction) -> String {
+        match action {
+            ComposeAction::Commit(text) => text,
+            other => panic!("expected a commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dead_acute_then_c_commits_cedilla() {
+        let compose = ComposeState::from_buffer(TABLE);
+        assert!(matches!(
+            compose.feed(Keysym::dead_acute),
+            ComposeAction::Composing
+        ));
+        assert_eq!(commit(compose.feed(Keysym::c)), "ç");
+    }
+
+    #[test]
+    fn dead_acute_then_a_commits_acute() {
+        let compose = ComposeState::from_buffer(TABLE);
+        let _ = compose.feed(Keysym::dead_acute);
+        assert_eq!(commit(compose.feed(Keysym::a)), "á");
+    }
+
+    #[test]
+    fn plain_key_is_forwarded_untouched() {
+        let compose = ComposeState::from_buffer(TABLE);
+        assert!(matches!(compose.feed(Keysym::b), ComposeAction::Forward));
+    }
+
+    #[test]
+    fn sequence_cancelled_by_navigation_key_forwards_it() {
+        // A pending dead key must not swallow Left/BackSpace/Home. Picking a navigation
+        // keysym on purpose: most letters do compose with an acute in real tables (`'`+`z`
+        // is `ź`), so a letter is a bad stand-in for "no such sequence".
+        let compose = ComposeState::from_buffer(TABLE);
+        let _ = compose.feed(Keysym::dead_acute);
+        assert!(matches!(compose.feed(Keysym::Left), ComposeAction::Forward));
+    }
+
+    #[test]
+    fn navigation_keys_are_never_touched() {
+        let compose = ComposeState::from_buffer(TABLE);
+        for key in [
+            Keysym::Left,
+            Keysym::BackSpace,
+            Keysym::Home,
+            Keysym::Return,
+        ] {
+            assert!(
+                matches!(compose.feed(key), ComposeAction::Forward),
+                "{key:?} should be forwarded untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn state_is_clean_after_a_completed_sequence() {
+        let compose = ComposeState::from_buffer(TABLE);
+        let _ = compose.feed(Keysym::dead_acute);
+        let _ = compose.feed(Keysym::c);
+        // A following plain key must not be eaten by leftover state.
+        assert!(matches!(compose.feed(Keysym::b), ComposeAction::Forward));
+    }
+
+    #[test]
+    fn reset_drops_a_partial_sequence() {
+        let compose = ComposeState::from_buffer(TABLE);
+        let _ = compose.feed(Keysym::dead_acute);
+        compose.reset();
+        assert!(matches!(compose.feed(Keysym::c), ComposeAction::Forward));
     }
 }

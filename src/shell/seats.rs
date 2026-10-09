@@ -5,7 +5,9 @@ use std::{any::Any, cell::RefCell, collections::HashMap, sync::Mutex};
 use crate::{
     backend::render::cursor::CursorState,
     config::{Config, xkb_config_to_wl},
-    input::{InputBackendId, ModifiersShortcutQueue, SupressedButtons, SupressedKeys},
+    input::{
+        ComposeState, InputBackendId, ModifiersShortcutQueue, SupressedButtons, SupressedKeys,
+    },
     state::State,
 };
 use smithay::{
@@ -22,7 +24,7 @@ use smithay::{
         wayland_server::{DisplayHandle, protocol::wl_surface::WlSurface},
     },
     utils::{Buffer, IsAlive, Logical, Monotonic, Point, Rectangle, Serial, Time, Transform},
-    wayland::compositor::with_states,
+    wayland::{compositor::with_states, text_input::TextInputSeat},
 };
 use tracing::warn;
 
@@ -221,6 +223,7 @@ pub fn create_seat(
     userdata.insert_if_missing_threadsafe(SeatId::default);
     userdata.insert_if_missing(Devices::default);
     userdata.insert_if_missing(SupressedKeys::default);
+    userdata.insert_if_missing(ComposeState::new);
     userdata.insert_if_missing(SupressedButtons::default);
     userdata.insert_if_missing(ModifiersShortcutQueue::default);
     userdata.insert_if_missing(LastModifierChange::default);
@@ -259,6 +262,15 @@ pub fn create_seat(
         )
     })
     .expect("Failed to load xkb configuration files");
+
+    // Claim the input-method role up front, so the first client to focus a text field can
+    // make its `zwp_text_input_v3` active (smithay discards `enable` otherwise) and compose
+    // works on the very first dead key rather than from the second one on. A real IME that
+    // binds later takes the role back in `State::update_compose_input_method`.
+    if seat.compose_state().is_available() {
+        seat.text_input().set_compositor_input_method(true);
+    }
+
     seat.add_pointer();
     seat.add_touch();
 
@@ -284,6 +296,7 @@ pub trait SeatExt {
     fn set_focused_output(&self, output: Option<&Output>);
     fn devices(&self) -> &Devices;
     fn supressed_keys(&self) -> &SupressedKeys;
+    fn compose_state(&self) -> &ComposeState;
     fn supressed_buttons(&self) -> &SupressedButtons;
     fn modifiers_shortcut_queue(&self) -> &ModifiersShortcutQueue;
     fn last_modifier_change(&self) -> Option<Serial>;
@@ -357,6 +370,10 @@ impl SeatExt for Seat<State> {
 
     fn supressed_keys(&self) -> &SupressedKeys {
         self.user_data().get::<SupressedKeys>().unwrap()
+    }
+
+    fn compose_state(&self) -> &ComposeState {
+        self.user_data().get::<ComposeState>().unwrap()
     }
 
     fn supressed_buttons(&self) -> &SupressedButtons {
